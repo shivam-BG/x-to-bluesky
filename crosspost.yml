@@ -1,0 +1,55 @@
+name: crosspost
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      args:
+        description: "Extra arguments, e.g. --dry-run or --backfill 3"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: crosspost
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Crosspost
+        env:
+          X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
+          BSKY_APP_PASSWORD: ${{ secrets.BSKY_APP_PASSWORD }}
+          ARGS: ${{ inputs.args }}
+        run: python crosspost.py $ARGS
+
+      - name: Save state
+        if: always()
+        run: |
+          git config user.name "crosspost-bot"
+          git config user.email "crosspost-bot@users.noreply.github.com"
+          git add state.json 2>/dev/null || true
+          if ! git diff --cached --quiet; then
+            git commit -m "update state"
+          fi
+          # GitHub disables scheduled workflows after 60 days without repo activity,
+          # so make an empty commit if the last one is over 45 days old.
+          if [ $(( $(date +%s) - $(git log -1 --format=%ct) )) -gt 3888000 ]; then
+            git commit --allow-empty -m "keepalive"
+          fi
+          git push

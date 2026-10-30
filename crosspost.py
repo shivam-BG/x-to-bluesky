@@ -7,6 +7,8 @@ quote tweets, long tweets (split into a Bluesky thread), links and hashtags.
 
 Setup:
     pip install -U atproto requests pillow
+    export X_USERNAME="..."             # your X handle, without the @
+    export BSKY_HANDLE="..."            # your full Bluesky handle
     export X_BEARER_TOKEN="..."         # from the X Developer Console
     export BSKY_APP_PASSWORD="..."      # Bluesky > Settings > Privacy and security > App passwords
 
@@ -14,9 +16,10 @@ Usage:
     python crosspost.py                 # first run: just records your latest tweet, posts nothing
     python crosspost.py --backfill 3    # first run: also post your 3 most recent tweets
     python crosspost.py --dry-run       # show what would be posted, change nothing
+    python crosspost.py --loop 60       # poll every 60 seconds for 55 minutes (near-real-time)
     (then run it on a schedule, e.g. cron every 10 minutes)
 
-Optional env vars: X_USERNAME, BSKY_HANDLE, STATE_FILE, CROSSPOST_RETWEETS=1
+Optional env vars: STATE_FILE, CROSSPOST_RETWEETS=1
 """
 import argparse
 import html
@@ -32,8 +35,8 @@ import requests
 from atproto import Client, models
 from PIL import Image, ImageOps
 
-X_USERNAME = os.environ.get("X_USERNAME", "beshearstan")
-BSKY_HANDLE = os.environ.get("BSKY_HANDLE", "beshearstan.bsky.social")
+X_USERNAME = os.environ["X_USERNAME"]
+BSKY_HANDLE = os.environ["BSKY_HANDLE"]
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
 CROSSPOST_RETWEETS = os.environ.get("CROSSPOST_RETWEETS", "0") == "1"
 
@@ -395,14 +398,8 @@ def publish(client, p, state):
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dry-run", action="store_true", help="print what would be posted; change nothing")
-    ap.add_argument("--backfill", type=int, default=0,
-                    help="on the very first run, also post this many recent tweets")
-    args = ap.parse_args()
-
-    state = load_state()
+def process(args, state, session):
+    """One poll of X. Returns True if a tweet failed to post."""
 
     def commit():
         if not args.dry_run:
@@ -419,16 +416,14 @@ def main():
                 state["last_id"] = str(max(int(t["id"]) for t in tweets))
             commit()
             print("Initialised. Only tweets posted from now on will be crossposted.")
-            return
+            return False
         tweets = tweets[-args.backfill:]
     else:
         tweets, ctx = fetch(state["user_id"], state["last_id"])
 
     if not tweets:
-        print("No new tweets.")
-        return
+        return False
 
-    client = None
     failed = False
     for t in tweets:
         tid = t["id"]
@@ -449,9 +444,10 @@ def main():
             print(f"\n[dry run] {tid} -> {kind}, {len(p['media'])} media\n{p['text']}")
             continue
 
-        client = client or login()
+        if "client" not in session:
+            session["client"] = login()
         try:
-            state["posted"][tid] = publish(client, p, state)
+            state["posted"][tid] = publish(session["client"], p, state)
             print(f"posted {tid}")
         except Exception as e:
             failed = True
@@ -460,12 +456,44 @@ def main():
             print(f"FAILED {tid} (attempt {n}/{MAX_FAILURES}): {e}", file=sys.stderr)
             if n < MAX_FAILURES:
                 save_state(state)
-                break  # retry next run, keeping order
+                break  # retry next poll, keeping order
             print(f"giving up on {tid}", file=sys.stderr)
 
         state["last_id"] = tid
         commit()
         time.sleep(1)
+
+    return failed
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true", help="print what would be posted; change nothing")
+    ap.add_argument("--backfill", type=int, default=0,
+                    help="on the very first run, also post this many recent tweets")
+    ap.add_argument("--loop", type=int, default=0, metavar="SECONDS",
+                    help="keep polling every SECONDS instead of running once")
+    ap.add_argument("--duration", type=int, default=55, metavar="MINUTES",
+                    help="with --loop, stop after this many minutes (default 55)")
+    args = ap.parse_args()
+
+    state = load_state()
+    session = {}
+    deadline = time.time() + args.duration * 60
+    failed = False
+
+    while True:
+        try:
+            failed = process(args, state, session)
+        except Exception as e:
+            if not args.loop:
+                raise
+            failed = True  # a network blip shouldn't kill a long-running loop
+            print(f"poll error: {e}", file=sys.stderr)
+
+        if not args.loop or time.time() + args.loop >= deadline:
+            break
+        time.sleep(args.loop if not failed else max(args.loop, 120))
 
     if failed:
         sys.exit(1)  # makes GitHub Actions email you about the failure

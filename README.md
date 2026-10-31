@@ -1,6 +1,6 @@
-# x-to-bluesky
+# X to Bluesky Crossposter
 
-Automatically copies new posts from X (Twitter) to Bluesky. Runs on GitHub Actions every 10 minutes, no server needed.
+Automatically copies new posts from X (Twitter) to Bluesky. Runs on GitHub Actions, no server needed. It checks X every 30 seconds, so new posts show up on Bluesky within about a minute.
 
 ## What gets crossposted
 
@@ -11,8 +11,7 @@ Automatically copies new posts from X (Twitter) to Bluesky. Runs on GitHub Actio
 | Images (up to 4) | Same images with alt text, auto-compressed if too large |
 | Video / GIF | Uploaded as video (falls back to a link to the original if it fails) |
 | Self-reply thread | Threaded reply chain |
-| Quote tweet of your own crossposted post | Real Bluesky quote post |
-| Quote tweet of anything else | Your text plus "Quoting @user" and a link to the original |
+| Quote tweet | Your text plus a tight screenshot-style image of the quoted tweet (avatar, name, text, photos, date). If the screenshot can't be made, it falls back to a "Quoting @user" text line with a link |
 | Replies to other people | Skipped |
 | Retweets | Skipped (set `CROSSPOST_RETWEETS=1` to include them) |
 
@@ -22,7 +21,7 @@ Edits and deletions on X are not synced.
 
 - `crosspost.py`: the crossposter
 - `requirements.txt`: Python dependencies
-- `.github/workflows/crosspost.yml`: the schedule (every 10 minutes)
+- `.github/workflows/crosspost.yml`: keeps the crossposter running
 - `state.json`: created automatically; remembers which tweets have been handled. Don't delete it, or the script will treat the next run as a first run.
 
 ## Setup
@@ -34,13 +33,14 @@ Edits and deletions on X are not synced.
    - `BSKY_HANDLE` (your full Bluesky handle)
    - `X_BEARER_TOKEN`
    - `BSKY_APP_PASSWORD`
-4. **First run**: open the Actions tab, choose **crosspost**, click **Run workflow**. The first run only records your latest post and posts nothing, so your history isn't copied over. The log should say "Initialised."
-5. From then on it runs by itself. New posts usually appear on Bluesky within 10 to 20 minutes.
+4. **First run**: open the Actions tab, choose **crosspost**, click **Run workflow**, and leave the arguments box empty. It records your latest post (older posts are not copied over; the log says "Initialised.") and then keeps watching for new ones.
+5. From then on it keeps itself going. Each run lasts about 55 minutes and starts the next one by itself, and a 30-minute schedule restarts it if the chain ever breaks.
 
 ## Manual runs
 
 In the Actions tab, **Run workflow** has an arguments box:
 
+- empty: start the continuous loop (checks every 30 seconds)
 - `--dry-run`: print what would be posted without posting or saving anything
 - `--backfill 3`: on the very first run only, also post your 3 most recent tweets
 
@@ -57,9 +57,10 @@ CROSSPOST_RETWEETS: "1"
 - **Run failed**: GitHub emails you. Open the run in the Actions tab and read the log. Common causes are out-of-credit X API, an expired or wrong token, or a wrong Bluesky app password.
 - **Nothing posted**: check the log for `skip` lines, which say why a tweet was skipped (for example, a reply to someone else).
 - **A tweet keeps failing**: it's retried up to 3 times, then skipped so it doesn't block newer tweets.
+- **Stop it**: Actions tab, **crosspost**, the **...** menu, **Disable workflow**. A run already in progress finishes (up to about an hour) and does not restart.
 - **Scheduled runs stopped**: GitHub pauses schedules on repos with no activity for 60 days. The workflow makes a small commit automatically to prevent this, but if it ever happens, click **Enable workflow** in the Actions tab.
 - **Want to reset**: delete `state.json` and run again. It will re-initialise and post nothing from before that point.
 
 ## Cost
 
-GitHub Actions is free for public repos. The X API charges per post read, so cost scales with how often you post. Check usage in the X Developer Console.
+GitHub Actions is free for public repos, so keep the repo public. X bills per post returned, so checks that find nothing new should cost nothing, but X's docs don't spell that out, so watch the Usage page in the X Developer Console for the first day or two.

@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
-Crosspost tweets from X (Twitter) to Bluesky.
+Crosspost posts from X (Twitter) to Bluesky.
 
 Handles: plain text, images (+ alt text), videos/GIFs, self-reply threads,
-quote tweets, long tweets (split into a Bluesky thread), links and hashtags.
+long posts (split into a Bluesky thread), links and hashtags.
+
+Quote tweets are posted the way people usually do it by hand on Bluesky: your
+text, plus a screenshot-style image of the quoted tweet (avatar, name, text,
+photos, date), cropped tight with no bars. The image is drawn from the tweet's
+own data with a headless browser (Playwright). If that ever fails, it falls
+back to a text pointer with a link, so nothing is lost.
 
 Setup:
-    pip install -U atproto requests pillow
+    pip install -U atproto requests pillow playwright
+    python -m playwright install --with-deps chromium
     export X_USERNAME="..."             # your X handle, without the @
     export BSKY_HANDLE="..."            # your full Bluesky handle
     export X_BEARER_TOKEN="..."         # from the X Developer Console
@@ -16,20 +23,26 @@ Usage:
     python crosspost.py                 # first run: just records your latest tweet, posts nothing
     python crosspost.py --backfill 3    # first run: also post your 3 most recent tweets
     python crosspost.py --dry-run       # show what would be posted, change nothing
-    python crosspost.py --loop 60       # poll every 60 seconds for 55 minutes (near-real-time)
-    (then run it on a schedule, e.g. cron every 10 minutes)
+    python crosspost.py --loop 30       # keep checking every 30 seconds for 55 minutes
 
-Optional env vars: STATE_FILE, CROSSPOST_RETWEETS=1
+Optional env vars: STATE_FILE, CROSSPOST_RETWEETS=1, TIMEZONE (for the date on
+screenshots, default America/Chicago), CROSSPOST_GIT_PUSH=1 (GitHub Actions only),
+CHROMIUM_PATH.
 """
 import argparse
+import base64
 import html
 import io
 import json
+import math
 import os
 import re
+import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import requests
 from atproto import Client, models
@@ -39,6 +52,7 @@ X_USERNAME = os.environ["X_USERNAME"]
 BSKY_HANDLE = os.environ["BSKY_HANDLE"]
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
 CROSSPOST_RETWEETS = os.environ.get("CROSSPOST_RETWEETS", "0") == "1"
+TIMEZONE = os.environ.get("TIMEZONE", "America/Chicago")
 
 X_API = "https://api.x.com/2"
 TEXT_LIMIT = 295          # Bluesky max is 300 graphemes; keep some headroom
@@ -47,6 +61,9 @@ MAX_FAILURES = 3          # give up on a tweet after this many failed attempts
 
 TWEET_FIELDS = "created_at,entities,referenced_tweets,in_reply_to_user_id,note_tweet,attachments,author_id,lang"
 MEDIA_FIELDS = "type,url,alt_text,variants,width,height,preview_image_url"
+USER_FIELDS = "username,name,profile_image_url,verified,verified_type"
+EXPANSIONS = ("attachments.media_keys,referenced_tweets.id,referenced_tweets.id.author_id,"
+              "referenced_tweets.id.attachments.media_keys")
 
 URL_RE = re.compile(r"https?://\S+")
 TAG_RE = re.compile(r"(?<![\w/])#(\w+)")
@@ -65,6 +82,30 @@ def save_state(state):
     tmp = STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=2))
     tmp.replace(STATE_FILE)
+
+
+def git_push_state():
+    """On GitHub Actions: commit state.json right after each post, so a crashed
+    runner can never cause the same tweet to be posted twice."""
+    if os.environ.get("CROSSPOST_GIT_PUSH") != "1":
+        return
+
+    def run(*cmd):
+        return subprocess.run(cmd, capture_output=True, text=True)
+
+    run("git", "config", "user.name", "crosspost-bot")
+    run("git", "config", "user.email", "crosspost-bot@users.noreply.github.com")
+    for _ in range(3):
+        run("git", "fetch", "-q", "origin", "main")
+        run("git", "reset", "-q", "origin/main")   # newest remote commit, our files stay on disk
+        run("git", "add", str(STATE_FILE))
+        if run("git", "diff", "--cached", "--quiet").returncode == 0:
+            return
+        run("git", "commit", "-q", "-m", "update state")
+        if run("git", "push", "origin", "HEAD:main").returncode == 0:
+            return
+        time.sleep(3)
+    print("warning: could not push state.json", file=sys.stderr)
 
 
 # --------------------------------------------------------------------------
@@ -102,9 +143,9 @@ def fetch(user_id, since_id=None, max_results=100, pages=5):
     params = {
         "max_results": max(5, min(100, max_results)),
         "tweet.fields": TWEET_FIELDS,
-        "expansions": "attachments.media_keys,referenced_tweets.id,referenced_tweets.id.author_id",
+        "expansions": EXPANSIONS,
         "media.fields": MEDIA_FIELDS,
-        "user.fields": "username",
+        "user.fields": USER_FIELDS,
     }
     if since_id:
         params["since_id"] = since_id
@@ -160,7 +201,8 @@ def clean_text(t, strip_mentions=False, quoted_id=None):
 
 
 def split_text(text, limit=TEXT_LIMIT):
-    """Split long text into <=limit chunks on newlines/spaces."""
+    """Split long text into <=limit chunks on newlines/spaces.
+    (Bluesky shows its own 1/2, 2/2 labels on self-threads.)"""
     chunks = []
     while len(text) > limit:
         cut = text.rfind("\n", 0, limit)
@@ -229,6 +271,193 @@ def best_video_url(media):
 
 
 # --------------------------------------------------------------------------
+# Quote tweets: draw the quoted tweet as a screenshot-style card
+# --------------------------------------------------------------------------
+CARD_W = 600        # CSS pixels; the image is rendered at 2x (1200 px wide)
+MAX_RATIO = 1.9     # widest card allowed (width/height). Bluesky letterboxes very
+                    # wide images with dark bars, so short tweets get a little
+                    # extra white space instead.
+
+CARD_CSS = """
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{background:#fff;width:600px}
+#card{width:600px;background:#fff;color:#0f1419;padding:32px;display:flex;flex-direction:column;
+  justify-content:center;-webkit-font-smoothing:antialiased;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Helvetica,Arial,
+  "Liberation Sans","Noto Sans","Noto Color Emoji",sans-serif}
+.head{display:flex;align-items:center;gap:14px;margin-bottom:18px}
+.av{width:56px;height:56px;border-radius:50%;object-fit:cover;background:#cfd9de;flex:none}
+.who{min-width:0}
+.name{display:flex;align-items:center;gap:6px;font-weight:700;font-size:22px;line-height:1.25}
+.name span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.name svg{flex:none}
+.handle{color:#536471;font-size:19px;line-height:1.3}
+.body{font-size:25px;line-height:1.38;white-space:pre-wrap;overflow-wrap:anywhere}
+.l{color:#1d9bf0}
+.media{display:grid;gap:4px;margin-top:18px;border-radius:18px;overflow:hidden;
+  border:1px solid #eff3f4;grid-template-columns:1fr}
+.m2,.m3,.m4{grid-template-columns:1fr 1fr}
+.m3,.m4{grid-template-rows:1fr 1fr}
+.m3 .c:first-child{grid-row:span 2}
+.c{position:relative;overflow:hidden;min-height:0;background:#eff3f4}
+.c img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.play{position:absolute;left:50%;top:50%;width:84px;height:84px;margin:-42px 0 0 -42px;
+  border-radius:50%;background:rgba(15,20,25,.75)}
+.play::after{content:"";position:absolute;left:34px;top:26px;border-left:28px solid #fff;
+  border-top:16px solid transparent;border-bottom:16px solid transparent}
+.date{color:#536471;font-size:19px;margin-top:18px}
+"""
+
+CHECK_SVG = ('<svg viewBox="0 0 24 24" width="22" height="22"><circle cx="12" cy="12" r="11" fill="#1d9bf0"/>'
+             '<path d="M7 12.5l3.2 3.2L17 9" stroke="#fff" stroke-width="2.4" fill="none" '
+             'stroke-linecap="round" stroke-linejoin="round"/></svg>')
+
+# links are marked with private-use characters so they can be coloured later
+TOKEN_RE = re.compile(r"([^]*(?:|$)|(?<![\w])@\w{1,15}|(?<![\w/&])#\w*[^\W\d_]\w*)")
+
+
+def make_card(q, ctx):
+    media = [ctx.media[k] for k in q.get("attachments", {}).get("media_keys", []) if k in ctx.media]
+    return {"tweet": q, "author": ctx.users.get(q.get("author_id")), "media": media}
+
+
+def to_data_uri(url):
+    """Download an image and return (data URI, width, height), or (None, 0, 0)."""
+    try:
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        img = Image.open(io.BytesIO(r.content))
+        mime = Image.MIME.get(img.format, "image/jpeg")
+        return f"data:{mime};base64," + base64.b64encode(r.content).decode(), img.width, img.height
+    except Exception:
+        return None, 0, 0
+
+
+def card_text(t):
+    """Return (text with link markers, plain text) for the quoted tweet."""
+    note = t.get("note_tweet")
+    text = note["text"] if note else t["text"]
+    ents = (note or t).get("entities", {})
+    inner = {r["id"] for r in t.get("referenced_tweets", []) if r["type"] == "quoted"}
+    plain = text
+    for u in ents.get("urls", []):
+        expanded = u.get("expanded_url") or u["url"]
+        m = re.search(r"/status/(\d+)", expanded)
+        drop = ("media_key" in u or re.search(r"/(photo|video)/\d+$", expanded)
+                or (m and m.group(1) in inner))
+        shown = u.get("display_url") or expanded
+        text = text.replace(u["url"], "" if drop else f"{shown}")
+        plain = plain.replace(u["url"], "" if drop else expanded)
+    text = re.sub(r"\n{3,}", "\n\n", html.unescape(text)).strip()
+    plain = re.sub(r"\n{3,}", "\n\n", html.unescape(plain)).strip()
+    if len(text) > 700:
+        text = text[:699].rstrip() + "…"
+    return text, plain
+
+
+def html_body(text):
+    out = []
+    for i, part in enumerate(TOKEN_RE.split(text)):
+        if not part:
+            continue
+        if i % 2:  # a link, @mention or #hashtag
+            out.append(f'<span class="l">{html.escape(part.strip(chr(0xe000) + chr(0xe001)))}</span>')
+        else:
+            out.append(html.escape(part))
+    return "".join(out)
+
+
+def fmt_date(iso):
+    try:
+        d = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(ZoneInfo(TIMEZONE))
+        return f"{d.strftime('%b')} {d.day}, {d.year}"
+    except Exception:
+        return ""
+
+
+def build_card_html(card):
+    """Return (html, alt_text) for a quoted tweet."""
+    q, a = card["tweet"], card["author"] or {}
+    name = a.get("name") or a.get("username") or "X user"
+    handle = f"@{a['username']}" if a.get("username") else ""
+    verified = a.get("verified") or a.get("verified_type") in ("blue", "business", "government")
+
+    avatar = ""
+    if a.get("profile_image_url"):
+        uri = to_data_uri(a["profile_image_url"].replace("_normal.", "_400x400."))[0]
+        if uri:
+            avatar = f'<img class="av" src="{uri}">'
+    if not avatar:
+        avatar = '<div class="av"></div>'
+
+    tiles = []
+    for m in card["media"][:4]:
+        url = m["url"] + "?name=medium" if m["type"] == "photo" else m.get("preview_image_url")
+        if not url:
+            continue
+        uri, w, h = to_data_uri(url)
+        if uri:
+            tiles.append((uri, m.get("width") or w, m.get("height") or h, m["type"] != "photo"))
+    media_html = ""
+    if tiles:
+        if len(tiles) == 1:
+            w, h = tiles[0][1], tiles[0][2]
+            ratio = min(2.0, max(0.75, w / h)) if w and h else 1.78
+            style = f"aspect-ratio:{ratio:.3f}"
+        else:
+            style = "aspect-ratio:16/9"
+        cells = "".join(
+            f'<div class="c"><img src="{u}">{"<div class=play></div>" if v else ""}</div>'
+            for u, _, _, v in tiles)
+        media_html = f'<div class="media m{len(tiles)}" style="{style}">{cells}</div>'
+
+    marked, plain = card_text(q)
+    body = f'<div class="body">{html_body(marked)}</div>' if marked else ""
+    date = fmt_date(q.get("created_at", ""))
+    page = (
+        f'<!doctype html><html><head><meta charset="utf-8"><style>{CARD_CSS}</style></head><body>'
+        f'<div id="card"><div class="head">{avatar}<div class="who">'
+        f'<div class="name"><span>{html.escape(name)}</span>{CHECK_SVG if verified else ""}</div>'
+        f'<div class="handle">{html.escape(handle)}</div></div></div>'
+        f'{body}{media_html}<div class="date">{html.escape(date)}</div></div></body></html>'
+    )
+    alt = f"Screenshot of a post by {name} ({handle}) on X"
+    alt += f", {date}" if date else ""
+    alt += f": {plain}" if plain else "."
+    return page, alt[:1900]
+
+
+def render_card(card):
+    """Draw the quoted tweet as a tight PNG. Returns (png_bytes, alt_text)."""
+    from playwright.sync_api import sync_playwright  # only needed for quote tweets
+
+    page_html, alt = build_card_html(card)
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(executable_path=os.environ.get("CHROMIUM_PATH") or None)
+        try:
+            page = browser.new_page(viewport={"width": CARD_W, "height": 900}, device_scale_factor=2)
+            page.set_content(page_html, wait_until="load")
+            page.evaluate("document.fonts.ready.then(() => true)")
+            height = page.evaluate("document.getElementById('card').getBoundingClientRect().height")
+            min_h = math.ceil(CARD_W / MAX_RATIO)
+            if height < min_h:  # keep short tweets from becoming a thin strip
+                page.evaluate(f"document.getElementById('card').style.minHeight = '{min_h}px'")
+            png = page.locator("#card").screenshot(type="png")
+        finally:
+            browser.close()
+    return png, alt
+
+
+def quote_pointer(q, ctx):
+    """Text fallback for a quoted tweet (used only if the screenshot can't be made)."""
+    qa = ctx.username(q.get("author_id"))
+    snippet = re.sub(r"\s+", " ", re.sub(r"https?://\S+", "", clean_text(q))).strip()
+    if len(snippet) > 120:
+        snippet = snippet[:119] + "…"
+    return f"↪ Quoting @{qa}: “{snippet}”\nhttps://x.com/{qa}/status/{q['id']}"
+
+
+# --------------------------------------------------------------------------
 # Deciding what to post
 # --------------------------------------------------------------------------
 def plan(t, ctx, state):
@@ -238,16 +467,15 @@ def plan(t, ctx, state):
     lang = t.get("lang")
     lang = lang if lang and re.fullmatch(r"[a-z]{2}", lang) else None
 
-    # Retweets
+    # Retweets: just the screenshot of the original
     if "retweeted" in refs:
         if not CROSSPOST_RETWEETS:
             return None, "retweet"
         orig = ctx.tweets.get(refs["retweeted"])
         if not orig:
             return None, "retweeted tweet unavailable"
-        author = ctx.username(orig.get("author_id"))
-        text = f"🔁 @{author}:\n\n{clean_text(orig)}\n\nhttps://x.com/{author}/status/{orig['id']}"
-        return dict(text=text, media=[], quote_id=None, parent=None, lang=None, url=tweet_url(tid)), None
+        return dict(text="", media=[], card=make_card(orig, ctx), pointer=quote_pointer(orig, ctx),
+                    parent=None, lang=None, url=tweet_url(tid)), None
 
     # Replies: only keep self-replies (threads) whose parent we crossposted
     parent = None
@@ -261,30 +489,26 @@ def plan(t, ctx, state):
     quoted_id = refs.get("quoted")
     text = clean_text(t, strip_mentions=parent is not None, quoted_id=quoted_id)
     media = [ctx.media[k] for k in t.get("attachments", {}).get("media_keys", []) if k in ctx.media]
-    has_video = any(m["type"] != "photo" for m in media)
+    photos = [m for m in media if m["type"] == "photo"]
+    has_video = len(photos) != len(media)
 
-    # Quote tweets: real Bluesky quote if we crossposted the original,
-    # otherwise a text pointer + link to the original tweet.
-    quote_id = None
+    # Quote tweets: your text + a screenshot of the quoted tweet as an image.
+    # (A video can't be mixed with images, and Bluesky allows 4 images, so those
+    # rare cases get a text pointer + link instead.)
+    card, pointer = None, ""
     if quoted_id:
-        if quoted_id in state["posted"] and not has_video:
-            quote_id = quoted_id
+        q = ctx.tweets.get(quoted_id)
+        pointer = quote_pointer(q, ctx) if q else f"↪ https://x.com/i/status/{quoted_id}"
+        if q and not has_video and len(photos) < 4:
+            card = make_card(q, ctx)
         else:
-            q = ctx.tweets.get(quoted_id)
-            if q:
-                qa = ctx.username(q.get("author_id"))
-                snippet = re.sub(r"https?://\S+", "", clean_text(q))
-                snippet = re.sub(r"\s+", " ", snippet).strip()
-                if len(snippet) > 120:
-                    snippet = snippet[:119] + "…"
-                text += f"\n\n↪ Quoting @{qa}: “{snippet}”\nhttps://x.com/{qa}/status/{quoted_id}"
-            else:
-                text += f"\n\n↪ Quoting: https://x.com/i/status/{quoted_id}"
-        text = text.strip()
+            text = f"{text}\n\n{pointer}".strip()
+            pointer = ""
 
-    if not text and not media and not quote_id:
+    if not text and not media and not card:
         return None, "nothing to post"
-    return dict(text=text, media=media, quote_id=quote_id, parent=parent, lang=lang, url=tweet_url(tid)), None
+    return dict(text=text, media=media, card=card, pointer=pointer, parent=parent, lang=lang,
+                url=tweet_url(tid)), None
 
 
 # --------------------------------------------------------------------------
@@ -310,34 +534,29 @@ def create_post(client, text, facets, embed, reply, langs):
     return resp.uri, resp.cid
 
 
-def build_embed(client, p):
-    """Returns (embed, video_media_or_None)."""
-    images = [m for m in p["media"] if m["type"] == "photo"]
+def upload_image(client, data, alt):
+    data, w, h = shrink_image(data)
+    blob = client.upload_blob(data).blob
+    return models.AppBskyEmbedImages.Image(
+        alt=(alt or "")[:1900],
+        image=blob,
+        aspect_ratio=models.AppBskyEmbedDefs.AspectRatio(width=w, height=h),
+    )
+
+
+def build_embed(client, p, card_img):
+    """Returns (embed, video_media_or_None). card_img is (png_bytes, alt) or None."""
+    photos = [m for m in p["media"] if m["type"] == "photo"]
     video = next((m for m in p["media"] if m["type"] != "photo"), None)
 
-    images_embed = None
-    if images:
-        items = []
-        for m in images[:4]:
-            raw = requests.get(m["url"] + "?name=large", timeout=30)
-            raw.raise_for_status()
-            data, w, h = shrink_image(raw.content)
-            blob = client.upload_blob(data).blob
-            items.append(models.AppBskyEmbedImages.Image(
-                alt=(m.get("alt_text") or "")[:1900],
-                image=blob,
-                aspect_ratio=models.AppBskyEmbedDefs.AspectRatio(width=w, height=h),
-            ))
-        images_embed = models.AppBskyEmbedImages.Main(images=items)
-
-    quote_embed = None
-    if p["quote_id"]:
-        q = p["quote_state"]
-        quote_embed = models.AppBskyEmbedRecord.Main(record=strong_ref(q["first_uri"], q["first_cid"]))
-
-    if quote_embed and images_embed:
-        return models.AppBskyEmbedRecordWithMedia.Main(record=quote_embed, media=images_embed), video
-    return quote_embed or images_embed, video
+    items = []
+    for m in photos[: 3 if card_img else 4]:
+        raw = requests.get(m["url"] + "?name=large", timeout=30)
+        raw.raise_for_status()
+        items.append(upload_image(client, raw.content, m.get("alt_text")))
+    if card_img:
+        items.append(upload_image(client, card_img[0], card_img[1]))
+    return (models.AppBskyEmbedImages.Main(images=items) if items else None), video
 
 
 def post_video(client, text, facets, video, reply, langs):
@@ -358,9 +577,15 @@ def post_video(client, text, facets, video, reply, langs):
 
 def publish(client, p, state):
     """Post one tweet (as one or more Bluesky posts). Returns the state entry."""
-    if p["quote_id"]:
-        p["quote_state"] = state["posted"][p["quote_id"]]
-    embed, video = build_embed(client, p)
+    card_img = None
+    if p.get("card"):
+        try:
+            card_img = render_card(p["card"])
+        except Exception as e:  # never lose the post just because the screenshot failed
+            print(f"  screenshot failed ({e}); using a text pointer instead", file=sys.stderr)
+            p["text"] = f"{p['text']}\n\n{p['pointer']}".strip() if p.get("pointer") else p["text"]
+
+    embed, video = build_embed(client, p, card_img)
     langs = [p["lang"]] if p["lang"] else None
     parent = p["parent"]
 
@@ -440,7 +665,7 @@ def process(args, state, session):
             continue
 
         if args.dry_run:
-            kind = ("quote " if p["quote_id"] else "") + ("reply " if p["parent"] else "") + "post"
+            kind = ("quote " if p["card"] else "") + ("reply " if p["parent"] else "") + "post"
             print(f"\n[dry run] {tid} -> {kind}, {len(p['media'])} media\n{p['text']}")
             continue
 
@@ -461,6 +686,7 @@ def process(args, state, session):
 
         state["last_id"] = tid
         commit()
+        git_push_state()
         time.sleep(1)
 
     return failed
@@ -472,7 +698,7 @@ def main():
     ap.add_argument("--backfill", type=int, default=0,
                     help="on the very first run, also post this many recent tweets")
     ap.add_argument("--loop", type=int, default=0, metavar="SECONDS",
-                    help="keep polling every SECONDS instead of running once")
+                    help="keep checking every SECONDS instead of running once")
     ap.add_argument("--duration", type=int, default=55, metavar="MINUTES",
                     help="with --loop, stop after this many minutes (default 55)")
     args = ap.parse_args()
@@ -480,11 +706,12 @@ def main():
     state = load_state()
     session = {}
     deadline = time.time() + args.duration * 60
-    failed = False
+    failed, ok_polls = False, 0
 
     while True:
         try:
             failed = process(args, state, session)
+            ok_polls += 1
         except Exception as e:
             if not args.loop:
                 raise
@@ -493,10 +720,12 @@ def main():
 
         if not args.loop or time.time() + args.loop >= deadline:
             break
-        time.sleep(args.loop if not failed else max(args.loop, 120))
+        time.sleep(max(args.loop, 120) if failed else args.loop)
 
-    if failed:
-        sys.exit(1)  # makes GitHub Actions email you about the failure
+    # Exit code decides whether GitHub emails you. In loop mode, a single hiccup
+    # is fine; only fail if not one check worked (bad token, no credits, ...).
+    if (args.loop and ok_polls == 0) or (not args.loop and failed):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

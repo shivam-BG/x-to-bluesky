@@ -1,3 +1,4 @@
-   atproto
-   requests
-   pillow
+atproto
+requests
+pillow
+playwright
